@@ -6,7 +6,7 @@ toolchain go1.25.13
 
 require (
 	github.com/fgn/go-langfuse v0.10.0
-	github.com/fgn/jevgo v0.2.0
+	github.com/fgn/jevgo v0.3.0
 	github.com/matryer/is v1.4.1
 	go.opentelemetry.io/otel/sdk v1.45.0
 )
