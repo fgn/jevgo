@@ -7,11 +7,16 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
+	"maps"
 	"net/http"
 	"strconv"
 	"time"
 )
+
+// maxResponseBytes bounds memory per response; API bodies are kilobytes.
+const maxResponseBytes = 16 << 20
+
+var errResponseTooLarge = errors.New("response body exceeds 16 MiB")
 
 // result is the outcome of the last HTTP attempt of a call.
 type result struct {
@@ -23,28 +28,31 @@ type result struct {
 	attempts int
 }
 
-// do sends one API call, retrying according to the policy. On error, the
-// returned result still reports the attempt count and, for an API error,
-// the last response.
+// do sends one API call with retries. The result is returned even on error
+// so callers can read the attempt count.
 func (c *config) do(ctx context.Context, method, path string, body []byte) (result, error) {
 	res := result{method: method, url: c.baseURL + path}
 	policy := c.retry
+	callCtx := ctx
+	if policy.TotalTimeout > 0 {
+		var cancel context.CancelFunc
+		callCtx, cancel = context.WithTimeout(ctx, policy.TotalTimeout)
+		defer cancel()
+	}
 	started := time.Now()
 	for attempt := 0; ; attempt++ {
-		res.attempts = attempt + 1
 		err := ctx.Err()
 		if err != nil {
 			return res, c.contextError(res, err)
 		}
-		err = c.attempt(ctx, &res, body, attempt)
+		err = c.attempt(ctx, callCtx, &res, body, attempt)
 		if err == nil {
 			return res, nil
 		}
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || callCtx.Err() != nil {
 			return res, err
 		}
-		retriesLeft := policy.MaxRetries - attempt
-		if retriesLeft <= 0 || !policy.retryable(err) {
+		if policy.MaxRetries-attempt <= 0 || !policy.retryable(err) {
 			return res, err
 		}
 		delay := policy.delay(attempt, res.header, defaultRandom)
@@ -55,9 +63,9 @@ func (c *config) do(ctx context.Context, method, path string, body []byte) (resu
 			return res, err
 		}
 		c.logger.LogAttrs(ctx, slog.LevelInfo, "jev: retrying",
-			slog.String("method", method), slog.String("url", res.url),
-			slog.Duration("delay", delay), slog.Int("retry", attempt+1),
-			slog.Int("max_retries", policy.MaxRetries), slog.String("reason", retryReason(err)))
+			slog.String("method", method), slog.String("url", res.url), slog.Duration("delay", delay),
+			slog.Int("retry", attempt+1), slog.Int("max_retries", policy.MaxRetries),
+			slog.String("reason", retryReason(err)))
 		err = sleep(ctx, delay)
 		if err != nil {
 			return res, c.contextError(res, err)
@@ -65,12 +73,12 @@ func (c *config) do(ctx context.Context, method, path string, body []byte) (resu
 	}
 }
 
-// attempt performs one HTTP round trip under the per-attempt timeout and
-// records the outcome in res.
-func (c *config) attempt(ctx context.Context, res *result, body []byte, attempt int) error {
+// attempt performs one HTTP round trip. ctx is the caller's context and
+// callCtx additionally carries the TotalTimeout deadline.
+func (c *config) attempt(ctx, callCtx context.Context, res *result, body []byte, attempt int) error {
 	res.status, res.header, res.body = 0, nil, nil
 
-	attemptCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	attemptCtx, cancel := context.WithTimeout(callCtx, c.timeout)
 	defer cancel()
 
 	var reader io.Reader
@@ -79,23 +87,22 @@ func (c *config) attempt(ctx context.Context, res *result, body []byte, attempt 
 	}
 	req, err := http.NewRequestWithContext(attemptCtx, res.method, res.url, reader)
 	if err != nil {
-		return fmt.Errorf("%w: build request: %w", ErrInvalidRequest, err)
+		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	c.setHeaders(req, body != nil, attempt)
-
 	if c.logger.Enabled(ctx, slog.LevelDebug) {
 		c.logger.LogAttrs(ctx, slog.LevelDebug, "jev: request",
 			slog.String("method", res.method), slog.String("url", res.url), slog.Int("attempt", attempt+1),
 			slog.Any("headers", redactedHeaders(req.Header)), slog.String("body", string(body)))
 	}
 
+	res.attempts++
 	started := time.Now()
-	httpRes, err := c.httpClient.Do(req)
+	httpRes, err := c.httpClient.Do(req) //nolint:bodyclose // closed by readBody.
 	if err == nil {
 		res.status = httpRes.StatusCode
 		res.header = httpRes.Header
-		res.body, err = io.ReadAll(httpRes.Body)
-		_ = httpRes.Body.Close()
+		res.body, err = readBody(httpRes.Body)
 	}
 	elapsed := time.Since(started)
 	if err != nil {
@@ -105,8 +112,14 @@ func (c *config) attempt(ctx context.Context, res *result, body []byte, attempt 
 				slog.String("method", res.method), slog.String("url", res.url), slog.Duration("elapsed", elapsed))
 			return c.contextError(*res, ctxErr)
 		}
-		connErr := &ConnectionError{Method: res.method, URL: res.url, Err: err}
-		if errors.Is(attemptCtx.Err(), context.DeadlineExceeded) || isTimeout(err) {
+		connErr := &ConnectionError{
+			Method: res.method, URL: res.url, Elapsed: elapsed, StatusCode: res.status,
+			RequestID: res.header.Get(requestIDHeader), Attempts: res.attempts, Err: err,
+		}
+		switch {
+		case c.retry.TotalTimeout > 0 && callCtx.Err() != nil:
+			connErr.Timeout = c.retry.TotalTimeout
+		case errors.Is(attemptCtx.Err(), context.DeadlineExceeded):
 			connErr.Timeout = c.timeout
 		}
 		c.logger.LogAttrs(ctx, slog.LevelInfo, "jev: request failed",
@@ -129,14 +142,21 @@ func (c *config) attempt(ctx context.Context, res *result, body []byte, attempt 
 	return newAPIError(*res)
 }
 
-// setHeaders applies caller headers first so protected SDK headers always
-// win.
-func (c *config) setHeaders(req *http.Request, hasBody bool, attempt int) {
-	for name, values := range c.headers {
-		for _, value := range values {
-			req.Header.Add(name, value)
-		}
+func readBody(body io.ReadCloser) ([]byte, error) {
+	defer body.Close()
+	data, err := io.ReadAll(io.LimitReader(body, maxResponseBytes+1))
+	if err != nil {
+		return nil, err
 	}
+	if len(data) > maxResponseBytes {
+		return nil, errResponseTooLarge
+	}
+	return data, nil
+}
+
+// setHeaders applies caller headers first so the protected ones always win.
+func (c *config) setHeaders(req *http.Request, hasBody bool, attempt int) {
+	maps.Copy(req.Header, c.headers)
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", userAgent)
@@ -157,20 +177,14 @@ func (c *config) contextError(res result, err error) error {
 	return fmt.Errorf("jev: %s %s: %w", res.method, res.url, err)
 }
 
-func isTimeout(err error) bool {
-	var netErr net.Error
-	return errors.As(err, &netErr) && netErr.Timeout()
-}
-
 func retryReason(err error) string {
 	var api *APIError
-	var conn *ConnectionError
 	switch {
 	case errors.As(err, &api):
 		return "http " + strconv.Itoa(api.StatusCode)
-	case errors.As(err, &conn) && conn.Timeout > 0:
+	case errors.Is(err, ErrTimeout):
 		return "timeout"
-	case errors.As(err, &conn):
+	case errors.Is(err, ErrConnection):
 		return "connection error"
 	default:
 		return "error"

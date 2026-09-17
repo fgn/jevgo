@@ -8,21 +8,22 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"time"
 )
 
-// SDK defaults, matching the official TypeSafe SDKs.
+// Defaults, matching the official TypeSafe SDKs.
 const (
 	DefaultBaseURL = "https://api.typesafe.ai"
 	DefaultModel   = "jev-latest"
-	// DefaultTimeout is the per-attempt timeout; retries are not bounded by
-	// it. See [RetryPolicy.TotalTimeout] for a whole-call budget.
+	// DefaultTimeout applies to each HTTP attempt; see
+	// [RetryPolicy.TotalTimeout] for a whole-call deadline.
 	DefaultTimeout = 10 * time.Second
 )
 
-// Environment variables read by [NewClient] when the matching option is not
-// set. Empty or whitespace-only values are ignored.
+// Environment variables read when the matching option is not set. Blank
+// values are ignored.
 const (
 	EnvAPIKey       = "TYPESAFE_API_KEY"
 	EnvBaseURL      = "TYPESAFE_BASE_URL"
@@ -35,12 +36,11 @@ const (
 	modelsPath    = "/v1/models"
 )
 
-// ErrInvalidConfig is wrapped by every configuration error returned from
-// [NewClient] or from applying an [Option].
+// ErrInvalidConfig is wrapped by configuration errors.
 var ErrInvalidConfig = errors.New("jev: invalid configuration")
 
-// Client calls the TypeSafe API. It is safe for concurrent use; construct it
-// once with [NewClient] and share it.
+// Client calls the TypeSafe API. Create it with [NewClient]; it is safe for
+// concurrent use.
 type Client struct {
 	cfg config
 }
@@ -57,10 +57,10 @@ type config struct {
 	tracer       Tracer
 }
 
-// Option configures a [Client]. Options apply in order with last-wins
-// precedence. Every option is also accepted per call by [Client.SystemOne]
-// and [Client.ListModels], where it overrides the client setting for that
-// call only.
+// Option configures a [Client]. Options apply in order, last wins, and are
+// also accepted per call by [Client.SystemOne] and [Client.ListModels] as
+// overrides for that call. An empty string or nil value means "not set" and
+// falls back to the environment or the default.
 type Option func(*config) error
 
 // WithAPIKey sets the API key. Defaults to TYPESAFE_API_KEY.
@@ -71,8 +71,9 @@ func WithAPIKey(key string) Option {
 	}
 }
 
-// WithBaseURL sets the API root, for example for a proxy. Trailing slashes
-// are removed. Defaults to TYPESAFE_BASE_URL, then [DefaultBaseURL].
+// WithBaseURL sets the API root, for example a proxy. It must be an http or
+// https URL without credentials, query, or fragment. Defaults to
+// TYPESAFE_BASE_URL, then [DefaultBaseURL].
 func WithBaseURL(baseURL string) Option {
 	return func(c *config) error {
 		c.baseURL = strings.TrimSpace(baseURL)
@@ -89,10 +90,10 @@ func WithDefaultModel(model string) Option {
 	}
 }
 
-// WithHTTPClient sets the HTTP client used for requests. This is the place
-// to install an instrumented or customized transport. A nil client selects
-// [http.DefaultClient]. Per-attempt timeouts are applied through the request
-// context, so the client's own Timeout is not required.
+// WithHTTPClient sets the HTTP client, which is where to install a custom or
+// instrumented transport. Defaults to [http.DefaultClient]. Per-attempt
+// timeouts are applied through the request context; a Timeout on the client
+// also applies and is reported as a transport timeout.
 func WithHTTPClient(client *http.Client) Option {
 	return func(c *config) error {
 		c.httpClient = client
@@ -101,7 +102,7 @@ func WithHTTPClient(client *http.Client) Option {
 }
 
 // WithTimeout sets the timeout for each HTTP attempt, including reading the
-// full response body. It must be positive. Defaults to [DefaultTimeout].
+// response body. Defaults to [DefaultTimeout].
 func WithTimeout(timeout time.Duration) Option {
 	return func(c *config) error {
 		if timeout <= 0 {
@@ -112,53 +113,63 @@ func WithTimeout(timeout time.Duration) Option {
 	}
 }
 
-// WithRetryPolicy replaces the retry policy. Start from
-// [DefaultRetryPolicy] and adjust fields; a zero RetryPolicy disables
-// retries.
+// WithRetryPolicy replaces the retry policy.
 func WithRetryPolicy(policy RetryPolicy) Option {
+	policy = policy.clone()
 	return func(c *config) error {
 		err := policy.validate()
 		if err != nil {
 			return err
 		}
-		policy.Statuses = append([]int(nil), policy.Statuses...)
+		applied := policy.clone()
+		c.retry = &applied
+		return nil
+	}
+}
+
+// WithMaxRetries changes only the retry count, keeping the rest of the
+// current policy. 0 disables retries.
+func WithMaxRetries(n int) Option {
+	return func(c *config) error {
+		if n < 0 {
+			return fmt.Errorf("%w: retries must not be negative, got %d", ErrInvalidConfig, n)
+		}
+		policy := DefaultRetryPolicy()
+		if c.retry != nil {
+			policy = c.retry.clone()
+		}
+		policy.MaxRetries = n
 		c.retry = &policy
 		return nil
 	}
 }
 
-// WithHeader adds a header sent with every request. Authorization, Accept,
-// Content-Type, and the SDK identification headers cannot be overridden.
+// WithHeader sets a header sent with every request, replacing any earlier
+// value. Authorization, Accept, Content-Type, and the SDK identification
+// headers cannot be overridden.
 func WithHeader(key, value string) Option {
+	return WithHeaders(http.Header{key: {value}})
+}
+
+// WithHeaders sets headers sent with every request; each key replaces any
+// earlier values for that key.
+func WithHeaders(headers http.Header) Option {
 	return func(c *config) error {
 		if c.headers == nil {
 			c.headers = http.Header{}
 		}
-		c.headers.Add(key, value)
-		return nil
-	}
-}
-
-// WithHeaders adds headers sent with every request; see [WithHeader].
-func WithHeaders(headers http.Header) Option {
-	return func(c *config) error {
 		for key, values := range headers {
-			for _, value := range values {
-				err := WithHeader(key, value)(c)
-				if err != nil {
-					return err
-				}
-			}
+			c.headers[http.CanonicalHeaderKey(key)] = slices.Clone(values)
 		}
 		return nil
 	}
 }
 
-// WithLogger sets the logger. The SDK logs one summary record per HTTP
-// attempt at [slog.LevelInfo] and request and response headers and bodies
-// at [slog.LevelDebug]. Credential headers are redacted; bodies are not.
-// Without a logger, TYPESAFE_LOG_LEVEL (debug, info, warn, error, or off)
-// selects a level on [slog.Default]; unset means no logging.
+// WithLogger sets the logger: one record per HTTP attempt at
+// [slog.LevelInfo], and headers and bodies at [slog.LevelDebug]. Credential
+// headers are redacted; bodies, which contain your state and answers, are
+// not. Without a logger, TYPESAFE_LOG_LEVEL (debug, info, warn, error, or
+// off) selects a level on [slog.Default]; unset means no logging.
 func WithLogger(logger *slog.Logger) Option {
 	return func(c *config) error {
 		c.logger = logger
@@ -166,8 +177,7 @@ func WithLogger(logger *slog.Logger) Option {
 	}
 }
 
-// WithTracer sets the [Tracer] that observes SystemOne calls. Compose several
-// with [MultiTracer]. A nil tracer disables tracing.
+// WithTracer sets the [Tracer] observing SystemOne calls; nil disables it.
 func WithTracer(tracer Tracer) Option {
 	return func(c *config) error {
 		c.tracer = tracer
@@ -176,8 +186,8 @@ func WithTracer(tracer Tracer) Option {
 }
 
 // NewClient creates a client. Explicit options take precedence over
-// environment variables, which take precedence over SDK defaults. The API
-// key is required.
+// environment variables, which take precedence over defaults. The API key
+// is required.
 func NewClient(opts ...Option) (*Client, error) {
 	var cfg config
 	err := cfg.apply(opts)
@@ -200,32 +210,27 @@ func (c *Client) DefaultModel() string { return c.cfg.defaultModel }
 // SystemOne evaluates req.State against req.Questions and returns one answer
 // per question under the same names.
 //
-// Errors are [*APIError] for unsuccessful responses after retries,
-// [*ConnectionError] for transport failures and per-attempt timeouts after
-// retries, [*ResponseValidationError] for undecodable successful responses,
-// an error wrapping [ErrInvalidRequest] for requests rejected before
-// sending, and the context's error when ctx is done.
+// Errors are [*APIError] for unsuccessful responses, [*ConnectionError] for
+// transport failures and timeouts, both after retries;
+// [*ResponseValidationError] for a successful response that does not match
+// the contract; an error wrapping [ErrInvalidRequest] for requests rejected
+// before sending; and the context's error when ctx is done.
 func (c *Client) SystemOne(ctx context.Context, req Request, opts ...Option) (*Response, error) {
 	cfg, err := c.cfg.with(opts)
 	if err != nil {
 		return nil, err
 	}
-	model := req.Model
-	if model == "" {
-		model = cfg.defaultModel
-	}
-	body, err := req.marshal(model)
+	encoded, err := req.encode(cfg.defaultModel)
 	if err != nil {
 		return nil, err
 	}
-
 	if cfg.tracer != nil {
-		ctx = cfg.tracer.TraceSystemOneStart(ctx, SystemOneStartData{Request: &req, Model: model})
+		ctx = cfg.tracer.TraceSystemOneStart(ctx, SystemOneStartData{Request: &req, Model: encoded.model, Body: encoded.body})
 	}
-	res, err := cfg.do(ctx, http.MethodPost, systemOnePath, body)
+	res, err := cfg.do(ctx, http.MethodPost, systemOnePath, encoded.body)
 	var resp *Response
 	if err == nil {
-		resp, err = decodeSystemOne(res)
+		resp, err = decodeSystemOne(res, encoded.kinds)
 	}
 	if cfg.tracer != nil {
 		cfg.tracer.TraceSystemOneEnd(ctx, SystemOneEndData{Response: resp, Err: err, Attempts: res.attempts})
@@ -259,8 +264,11 @@ func (c *config) apply(opts []Option) error {
 	return nil
 }
 
-// with returns a copy of the configuration with per-call options applied.
+// with returns a copy with per-call options applied.
 func (c config) with(opts []Option) (config, error) {
+	if c.httpClient == nil {
+		return config{}, fmt.Errorf("%w: Client must be created with NewClient", ErrInvalidConfig)
+	}
 	if len(opts) == 0 {
 		return c, nil
 	}
@@ -276,8 +284,8 @@ func (c config) with(opts []Option) (config, error) {
 	return c, nil
 }
 
-// resolve fills unset fields from the environment and SDK defaults, then
-// validates the result. It is idempotent.
+// resolve fills unset fields from the environment and defaults, then
+// validates. It is idempotent.
 func (c *config) resolve() error {
 	if c.apiKey == "" {
 		c.apiKey = env(EnvAPIKey)
@@ -291,11 +299,11 @@ func (c *config) resolve() error {
 	if c.baseURL == "" {
 		c.baseURL = DefaultBaseURL
 	}
-	c.baseURL = strings.TrimRight(c.baseURL, "/")
-	parsed, err := url.Parse(c.baseURL)
-	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
-		return fmt.Errorf("%w: invalid base URL %q", ErrInvalidConfig, c.baseURL)
+	baseURL, err := parseBaseURL(c.baseURL)
+	if err != nil {
+		return err
 	}
+	c.baseURL = baseURL
 	if c.defaultModel == "" {
 		c.defaultModel = env(EnvDefaultModel)
 	}
@@ -313,13 +321,27 @@ func (c *config) resolve() error {
 		c.httpClient = http.DefaultClient
 	}
 	if c.logger == nil {
-		logger, err := loggerFromEnv()
-		if err != nil {
-			return err
-		}
-		c.logger = logger
+		c.logger, err = loggerFromEnv()
 	}
-	return nil
+	return err
+}
+
+// parseBaseURL rejects anything that could leak into logs and errors or
+// break path concatenation, without echoing the offending value.
+func parseBaseURL(raw string) (string, error) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", fmt.Errorf("%w: invalid base URL", ErrInvalidConfig)
+	}
+	switch {
+	case parsed.Scheme != "http" && parsed.Scheme != "https":
+		return "", fmt.Errorf("%w: base URL scheme must be http or https", ErrInvalidConfig)
+	case parsed.Host == "":
+		return "", fmt.Errorf("%w: base URL needs a host", ErrInvalidConfig)
+	case parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.ForceQuery:
+		return "", fmt.Errorf("%w: base URL must not contain credentials, a query, or a fragment", ErrInvalidConfig)
+	}
+	return strings.TrimRight(parsed.String(), "/"), nil
 }
 
 func env(name string) string {

@@ -59,9 +59,11 @@ tasks:
       - task: lint:govulncheck
   test:
     desc: run all tests in every module
+    env:
+      CGO_ENABLED: "1" # the race detector needs cgo
     cmds:
       - for: { var: MODULES }
-        cmd: cd {{.ITEM}} && go test {{ .CLI_ARGS | default "-count=1 -cover -timeout 60s ./..." }}
+        cmd: cd {{.ITEM}} && go test {{ .CLI_ARGS | default "-race -count=1 -cover -timeout 120s ./..." }}
   test:live:
     desc: run the tests against the real API using the TYPESAFE_API_KEY environment variable
     preconditions:

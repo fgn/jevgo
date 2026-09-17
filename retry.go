@@ -12,10 +12,11 @@ import (
 )
 
 // RetryPolicy controls how failed attempts are retried. Start from
-// [DefaultRetryPolicy] and adjust fields; the zero value disables retries.
+// [DefaultRetryPolicy] and adjust fields, or use [WithMaxRetries]; a zero
+// RetryPolicy disables retries.
 type RetryPolicy struct {
-	// MaxRetries is the maximum number of retries after the initial attempt;
-	// 0 disables retries. Default: 2.
+	// MaxRetries is the number of retries after the initial attempt.
+	// Default: 2.
 	MaxRetries int
 	// InitialBackoff is the first backoff delay, doubled each retry up to
 	// MaxBackoff. Default: 500ms.
@@ -28,7 +29,7 @@ type RetryPolicy struct {
 	// Statuses lists the HTTP status codes that are retried. Default: 408,
 	// 429, and 500 through 599.
 	Statuses []int
-	// RespectRetryAfter honors retry-after-ms and Retry-After response headers
+	// RespectRetryAfter honors Retry-After-Ms and Retry-After response headers
 	// up to MaxRetryAfter; longer delays fall back to backoff. Default: true.
 	RespectRetryAfter bool
 	// MaxRetryAfter is the longest server-requested delay honored. Default: 60s.
@@ -36,15 +37,17 @@ type RetryPolicy struct {
 	// ConnectionErrors retries connection failures, including interrupted
 	// response bodies. Default: true.
 	ConnectionErrors bool
-	// Timeouts retries per-attempt timeouts. Default: true.
+	// Timeouts retries attempts that timed out. Default: true.
 	Timeouts bool
-	// TotalTimeout bounds one call's attempts and delays together: a retry
-	// whose delay would reach the budget is skipped and the last error
-	// returned. Zero disables the budget; the caller's context deadline
-	// always applies. Default: 0.
+	// TotalTimeout is a deadline for the whole call, attempts and delays
+	// included. When it expires during an attempt the call fails with a
+	// [*ConnectionError] matching [ErrTimeout]; a retry whose delay would
+	// reach it is skipped and the last error returned. Zero disables it; the
+	// caller's context deadline always applies. Default: 0.
 	TotalTimeout time.Duration
-	// ShouldRetry, when set, is consulted for errors the built-in rules do
-	// not retry; returning true retries them. It never sees context errors.
+	// ShouldRetry, when set, is consulted for API and connection errors the
+	// rules above do not retry. It never sees context errors or response
+	// validation errors, which are not retried.
 	ShouldRetry func(error) bool
 }
 
@@ -68,6 +71,11 @@ func DefaultRetryPolicy() RetryPolicy {
 	}
 }
 
+func (p RetryPolicy) clone() RetryPolicy {
+	p.Statuses = slices.Clone(p.Statuses)
+	return p
+}
+
 func (p RetryPolicy) validate() error {
 	switch {
 	case p.MaxRetries < 0:
@@ -85,15 +93,12 @@ func (p RetryPolicy) validate() error {
 	return nil
 }
 
-// retryable decides whether err, from one attempt, may be retried. Context
-// errors from caller cancellation are never retried; the loop checks the
-// context before calling this.
 func (p RetryPolicy) retryable(err error) bool {
 	var conn *ConnectionError
 	var api *APIError
 	switch {
 	case errors.As(err, &conn):
-		if conn.Timeout > 0 {
+		if errors.Is(err, ErrTimeout) {
 			if p.Timeouts {
 				return true
 			}
@@ -104,29 +109,26 @@ func (p RetryPolicy) retryable(err error) bool {
 		if slices.Contains(p.Statuses, api.StatusCode) {
 			return true
 		}
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+	default:
 		return false
 	}
 	return p.ShouldRetry != nil && p.ShouldRetry(err)
 }
 
-// delay computes the wait before retry number attempt (zero-based): the
-// server's Retry-After when allowed, otherwise capped exponential backoff
-// with jitter.
+// delay is the wait before retry number attempt (zero-based): the server's
+// Retry-After when allowed, otherwise capped exponential backoff with jitter.
 func (p RetryPolicy) delay(attempt int, headers http.Header, random func() float64) time.Duration {
 	if p.RespectRetryAfter && headers != nil {
 		if after, ok := parseRetryAfter(headers); ok && after <= p.MaxRetryAfter {
 			return after
 		}
 	}
-	backoff := float64(p.InitialBackoff) * math.Pow(2, float64(attempt))
-	backoff = math.Min(backoff, float64(p.MaxBackoff))
+	backoff := math.Min(float64(p.InitialBackoff)*math.Pow(2, float64(attempt)), float64(p.MaxBackoff))
 	return time.Duration(backoff * (1 - random()*p.Jitter))
 }
 
 func defaultRandom() float64 { return rand.Float64() }
 
-// sleep waits for d or until ctx is done.
 func sleep(ctx context.Context, d time.Duration) error {
 	if d <= 0 {
 		return ctx.Err()

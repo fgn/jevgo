@@ -72,6 +72,19 @@ func attributes(span sdktrace.ReadOnlySpan) map[string]string {
 	return out
 }
 
+func TestComposedTracersEndTheirOwnObservations(t *testing.T) {
+	t.Parallel()
+	is := is.New(t)
+	lf, recorder := newLangfuse(t)
+	one := jevlangfuse.NewTracer(lf, jevlangfuse.WithObservationName("one"))
+	two := jevlangfuse.NewTracer(lf, jevlangfuse.WithObservationName("two"))
+	client := newClient(t, http.StatusOK, okBody, jev.MultiTracer(one, two))
+	_, err := client.SystemOne(t.Context(), request)
+	is.NoErr(err)
+	is.Equal(len(recorder.Started()), 2)
+	is.Equal(len(recorder.Ended()), 2) // both observations ended
+}
+
 func TestTracerRecordsGeneration(t *testing.T) {
 	t.Parallel()
 	is := is.New(t)
@@ -106,6 +119,8 @@ func TestTracerRecordsGeneration(t *testing.T) {
 	var input map[string]any
 	is.NoErr(json.Unmarshal([]byte(attrs["langfuse.observation.input"]), &input))
 	is.Equal(input["state"], request.State)
+	_, hasModel := input["model"]
+	is.True(!hasModel) // the model is its own field
 	is.True(strings.Contains(attrs["langfuse.observation.input"], `"type":"noul"`))
 	is.True(strings.Contains(attrs["langfuse.observation.output"], `"noul":0.92`))
 }

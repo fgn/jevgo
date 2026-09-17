@@ -1,40 +1,42 @@
 package jev
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
-// Tracer observes SystemOne calls. TraceSystemOneStart runs before the first
-// HTTP attempt and its returned context is used for every attempt, so a
-// tracer can parent child spans or carry state to TraceSystemOneEnd.
-// TraceSystemOneEnd runs once after the call completes, successfully or not.
+// Tracer observes SystemOne calls that passed local validation. The context
+// returned by TraceSystemOneStart is used for every HTTP attempt and passed
+// to TraceSystemOneEnd, which runs exactly once per traced call.
 //
-// Implementations must be safe for concurrent use. The Request and Response
-// are shared with the caller and must not be modified.
+// Implementations must be safe for concurrent use and must not modify the
+// data they receive.
 type Tracer interface {
 	TraceSystemOneStart(ctx context.Context, data SystemOneStartData) context.Context
 	TraceSystemOneEnd(ctx context.Context, data SystemOneEndData)
 }
 
-// SystemOneStartData describes a SystemOne call about to be sent.
+// SystemOneStartData describes a call about to be sent.
 type SystemOneStartData struct {
-	// Request is the caller's request.
 	Request *Request
-	// Model is the resolved model name sent to the API.
+	// Model is the model on the wire, after [Request.Extra] is applied.
 	Model string
+	// Body is the encoded wire request.
+	Body json.RawMessage
 }
 
-// SystemOneEndData describes a completed SystemOne call.
+// SystemOneEndData describes a completed call.
 type SystemOneEndData struct {
-	// Response is the decoded response, or nil when Err is non-nil.
+	// Response is nil when Err is non-nil.
 	Response *Response
-	// Err is the error returned to the caller, or nil.
-	Err error
-	// Attempts is the number of HTTP attempts made, including retries.
+	Err      error
+	// Attempts is the number of HTTP attempts made; zero when none was sent.
 	Attempts int
 }
 
-// MultiTracer returns a Tracer that calls each tracer in order. Start
-// contexts chain, so later tracers see values set by earlier ones; End runs
-// in reverse order.
+// MultiTracer composes tracers. Start contexts chain in order, so each
+// tracer sees values set by the ones before it; End runs in reverse order
+// with the context returned by the last Start.
 func MultiTracer(tracers ...Tracer) Tracer {
 	filtered := make([]Tracer, 0, len(tracers))
 	for _, t := range tracers {

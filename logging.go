@@ -8,25 +8,18 @@ import (
 	"strings"
 )
 
-// loggerFromEnv builds the default logger: silent unless TYPESAFE_LOG_LEVEL
-// selects a level, in which case records at or above it go to slog.Default.
 func loggerFromEnv() (*slog.Logger, error) {
 	raw := env(EnvLogLevel)
 	if raw == "" {
 		return slog.New(slog.DiscardHandler), nil
 	}
 	level, off, err := parseLogLevel(raw)
-	if err != nil {
-		return nil, err
-	}
-	if off {
-		return slog.New(slog.DiscardHandler), nil
+	if err != nil || off {
+		return slog.New(slog.DiscardHandler), err
 	}
 	return slog.New(&levelHandler{Handler: slog.Default().Handler(), level: level}), nil
 }
 
-// parseLogLevel returns the level, whether logging is off, and an error for
-// unknown values.
 func parseLogLevel(raw string) (slog.Level, bool, error) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "debug":
@@ -45,7 +38,6 @@ func parseLogLevel(raw string) (slog.Level, bool, error) {
 	}
 }
 
-// levelHandler filters an existing handler to a minimum level.
 type levelHandler struct {
 	slog.Handler
 	level slog.Level
@@ -63,14 +55,14 @@ func (h *levelHandler) WithGroup(name string) slog.Handler {
 	return &levelHandler{Handler: h.Handler.WithGroup(name), level: h.level}
 }
 
-// Header redaction, matching the official SDKs: credential headers keep
-// their scheme and the last four characters of long secrets; cookies and any
-// header whose name contains "token" or "secret" are fully masked.
 var (
 	keyHeaders    = map[string]bool{"authorization": true, "proxy-authorization": true, "x-api-key": true, "api-key": true}
 	opaqueHeaders = map[string]bool{"cookie": true, "set-cookie": true}
 )
 
+// redactHeaderValue matches the official SDKs: credential headers keep the
+// scheme and the last four characters of long secrets; cookies and headers
+// named like tokens or secrets are fully masked.
 func redactHeaderValue(name, value string) string {
 	lower := strings.ToLower(name)
 	switch {
@@ -86,8 +78,7 @@ func redactHeaderValue(name, value string) string {
 func redactKey(value string) string {
 	scheme, secret, found := strings.Cut(value, " ")
 	if !found {
-		secret = value
-		scheme = ""
+		scheme, secret = "", value
 	}
 	tail := ""
 	if len(secret) > 8 {
@@ -99,7 +90,6 @@ func redactKey(value string) string {
 	return "***" + tail
 }
 
-// redactedHeaders renders headers as a slog value with credentials masked.
 func redactedHeaders(headers http.Header) slog.Value {
 	attrs := make([]slog.Attr, 0, len(headers))
 	for name, values := range headers {

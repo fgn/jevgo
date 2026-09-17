@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -18,7 +20,7 @@ const (
 	sdkHeader          = "X-Typesafe-Sdk"
 	runtimeHeader      = "X-Typesafe-Runtime"
 	retryCountHeader   = "X-Typesafe-Retry-Count"
-	maxErrorBodyLength = 200
+	maxMessageLength   = 200
 )
 
 // Status sentinels matched by [*APIError] through errors.Is.
@@ -37,34 +39,29 @@ var (
 var (
 	// ErrConnection matches every ConnectionError.
 	ErrConnection = errors.New("jev: connection error")
-	// ErrTimeout matches a ConnectionError caused by the per-attempt timeout.
+	// ErrTimeout matches a ConnectionError caused by a timeout: the
+	// per-attempt timeout, [RetryPolicy.TotalTimeout], or the transport's own.
 	ErrTimeout = errors.New("jev: request timed out")
 )
 
-// APIError is an unsuccessful HTTP response from the API, returned after
-// any retries. It matches the status sentinels through errors.Is:
+// APIError is an unsuccessful HTTP response, returned after any retries.
+// It matches the status sentinels through errors.Is:
 //
 //	if errors.Is(err, jev.ErrRateLimit) { ... }
-//
-// or inspect it directly:
-//
-//	var apiErr *jev.APIError
-//	if errors.As(err, &apiErr) { log.Println(apiErr.StatusCode, apiErr.RequestID) }
 type APIError struct {
-	// StatusCode is the HTTP status code.
 	StatusCode int
-	// Method and URL identify the request, without credentials.
-	Method string
-	URL    string
-	// Header holds the HTTP response headers.
-	Header http.Header
+	Method     string
+	URL        string
+	Header     http.Header
 	// Body is the raw response body, or nil when empty.
 	Body []byte
-	// Message is the error message extracted from the body, or the truncated
-	// body when it has no recognizable message.
+	// Message is the server's message extracted from Body, or the body
+	// itself, truncated to 200 characters.
 	Message string
-	// RequestID is the x-typesafe-request-id header, or empty when absent.
+	// RequestID is the X-Typesafe-Request-Id header, or empty when absent.
 	RequestID string
+	// Attempts is the number of HTTP attempts made, including retries.
+	Attempts int
 }
 
 func newAPIError(res result) *APIError {
@@ -74,12 +71,12 @@ func newAPIError(res result) *APIError {
 		URL:        res.url,
 		Header:     res.header,
 		Body:       res.body,
-		Message:    describeBody(res.body),
+		Message:    truncate(describeBody(res.body)),
 		RequestID:  res.header.Get(requestIDHeader),
+		Attempts:   res.attempts,
 	}
 }
 
-// Error formats as "jev: METHOD URL: STATUS message (request_id=...)".
 func (e *APIError) Error() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "jev: %s %s: %d", e.Method, e.URL, e.StatusCode)
@@ -116,32 +113,41 @@ func (e *APIError) Is(target error) bool {
 	}
 }
 
-// RetryAfter returns the delay requested by the retry-after-ms or
+// RetryAfter returns the delay requested by the Retry-After-Ms or
 // Retry-After header, when present and valid.
 func (e *APIError) RetryAfter() (time.Duration, bool) {
 	return parseRetryAfter(e.Header)
 }
 
-// ConnectionError is a request that failed without an HTTP response: the
-// connection could not be made, the response body was interrupted, or the
-// per-attempt timeout elapsed. It is returned after any retries and
-// matches [ErrConnection] and, when Timeout is set, [ErrTimeout].
+// ConnectionError is a request that failed without a complete HTTP
+// response, returned after any retries. It matches [ErrConnection], and
+// [ErrTimeout] when the failure was a timeout.
 type ConnectionError struct {
-	// Method and URL identify the request, without credentials.
 	Method string
 	URL    string
-	// Timeout is the per-attempt timeout that elapsed, or zero when the
-	// failure was not a timeout.
+	// Elapsed is how long the failed attempt ran.
+	Elapsed time.Duration
+	// Timeout is the SDK limit that elapsed: the per-attempt timeout or
+	// [RetryPolicy.TotalTimeout]. It is zero when the failure was not an SDK
+	// timeout, including timeouts raised by the transport itself.
 	Timeout time.Duration
-	// Err is the underlying transport error.
-	Err error
+	// StatusCode and RequestID are set when the response headers arrived
+	// before the body failed.
+	StatusCode int
+	RequestID  string
+	Attempts   int
+	Err        error
 }
 
 func (e *ConnectionError) Error() string {
-	if e.Timeout > 0 {
-		return fmt.Sprintf("jev: %s %s: request timed out after %v: %v", e.Method, e.URL, e.Timeout, e.Err)
+	switch {
+	case e.Timeout > 0:
+		return fmt.Sprintf("jev: %s %s: timed out after %v (limit %v)", e.Method, e.URL, e.Elapsed, e.Timeout)
+	case isTimeout(e.Err):
+		return fmt.Sprintf("jev: %s %s: timed out after %v: %v", e.Method, e.URL, e.Elapsed, e.Err)
+	default:
+		return fmt.Sprintf("jev: %s %s: connection error after %v: %v", e.Method, e.URL, e.Elapsed, e.Err)
 	}
-	return fmt.Sprintf("jev: %s %s: connection error: %v", e.Method, e.URL, e.Err)
 }
 
 func (e *ConnectionError) Unwrap() error { return e.Err }
@@ -152,29 +158,31 @@ func (e *ConnectionError) Is(target error) bool {
 	case ErrConnection:
 		return true
 	case ErrTimeout:
-		return e.Timeout > 0
+		return e.Timeout > 0 || isTimeout(e.Err)
 	default:
 		return false
 	}
 }
 
+func isTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 // ResponseValidationError is a successful HTTP response whose body does not
-// match the API contract. Path names the first missing or invalid field,
-// such as "answers.tone.confidence".
+// match the API contract or the questions asked.
 type ResponseValidationError struct {
-	// StatusCode is the HTTP status code.
 	StatusCode int
-	// Method and URL identify the request, without credentials.
-	Method string
-	URL    string
-	// Path is the dotted path of the offending field.
-	Path string
-	// Body is the raw response body.
-	Body json.RawMessage
-	// RequestID is the x-typesafe-request-id header, or empty when absent.
+	Method     string
+	URL        string
+	// Path is the dotted path of the offending field, such as
+	// "answers.tone.confidence".
+	Path      string
+	Header    http.Header
+	Body      json.RawMessage
 	RequestID string
-	// Err is the underlying decode error.
-	Err error
+	Attempts  int
+	Err       error
 }
 
 func newResponseValidationError(res result, path string, err error) *ResponseValidationError {
@@ -183,8 +191,10 @@ func newResponseValidationError(res result, path string, err error) *ResponseVal
 		Method:     res.method,
 		URL:        res.url,
 		Path:       path,
+		Header:     res.header,
 		Body:       res.body,
 		RequestID:  res.header.Get(requestIDHeader),
+		Attempts:   res.attempts,
 		Err:        err,
 	}
 }
@@ -199,10 +209,16 @@ func (e *ResponseValidationError) Error() string {
 
 func (e *ResponseValidationError) Unwrap() error { return e.Err }
 
-// describeBody extracts a message from an error body the way the official
-// SDKs do: a plain string, error, error.message, message, detail,
-// detail.message, or a list of validation errors with loc and msg. Without
-// a recognizable message the body is truncated to 200 characters.
+func truncate(s string) string {
+	if len(s) <= maxMessageLength {
+		return s
+	}
+	return s[:maxMessageLength] + "…"
+}
+
+// describeBody extracts a message the way the official SDKs do: a plain
+// string, error, error.message, message, detail, detail.message, or a list
+// of validation errors with loc and msg.
 func describeBody(body []byte) string {
 	if len(body) == 0 {
 		return "status code (no body)"
@@ -215,11 +231,7 @@ func describeBody(body []byte) string {
 	if message := extractMessage(parsed); message != "" {
 		return message
 	}
-	raw := string(body)
-	if len(raw) > maxErrorBodyLength {
-		return raw[:maxErrorBodyLength] + "…"
-	}
-	return raw
+	return string(body)
 }
 
 func extractMessage(body any) string {
@@ -266,28 +278,26 @@ func describeValidationErrors(entries []any) string {
 		var loc []string
 		if items, ok := m["loc"].([]any); ok {
 			for _, item := range items {
-				s := fmt.Sprint(item)
-				if s != "body" {
+				if s := fmt.Sprint(item); s != "body" {
 					loc = append(loc, s)
 				}
 			}
 		}
 		if len(loc) > 0 {
-			parts = append(parts, strings.Join(loc, ".")+": "+msg)
-		} else {
-			parts = append(parts, msg)
+			msg = strings.Join(loc, ".") + ": " + msg
 		}
+		parts = append(parts, msg)
 	}
 	return strings.Join(parts, "; ")
 }
 
-// parseRetryAfter reads retry-after-ms (milliseconds) or Retry-After
-// (seconds or an HTTP date), preferring retry-after-ms.
+// parseRetryAfter prefers Retry-After-Ms (milliseconds) over Retry-After
+// (seconds or an HTTP date). Values beyond the representable range saturate.
 func parseRetryAfter(headers http.Header) (time.Duration, bool) {
 	if raw := strings.TrimSpace(headers.Get(retryAfterMSHeader)); raw != "" {
 		ms, err := strconv.ParseFloat(raw, 64)
-		if err == nil && ms >= 0 && !isInf(ms) {
-			return time.Duration(ms * float64(time.Millisecond)), true
+		if err == nil && ms >= 0 && !math.IsInf(ms, 0) {
+			return durationOf(ms * float64(time.Millisecond)), true
 		}
 	}
 	raw := strings.TrimSpace(headers.Get(retryAfterHeader))
@@ -296,10 +306,10 @@ func parseRetryAfter(headers http.Header) (time.Duration, bool) {
 	}
 	seconds, err := strconv.ParseFloat(raw, 64)
 	if err == nil {
-		if seconds < 0 || isInf(seconds) {
+		if seconds < 0 || math.IsInf(seconds, 0) || math.IsNaN(seconds) {
 			return 0, false
 		}
-		return time.Duration(seconds * float64(time.Second)), true
+		return durationOf(seconds * float64(time.Second)), true
 	}
 	date, err := http.ParseTime(raw)
 	if err == nil {
@@ -308,4 +318,9 @@ func parseRetryAfter(headers http.Header) (time.Duration, bool) {
 	return 0, false
 }
 
-func isInf(f float64) bool { return f > 1e300 || f < -1e300 || f != f }
+func durationOf(nanoseconds float64) time.Duration {
+	if nanoseconds >= math.MaxInt64 {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(nanoseconds)
+}

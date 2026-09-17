@@ -1,22 +1,21 @@
-// Package jevlangfuse records a Langfuse generation observation for every
-// TypeSafe SystemOne call made through github.com/fgn/jevgo, using
+// Package jevlangfuse records a Langfuse generation for every TypeSafe
+// SystemOne call made through github.com/fgn/jevgo, using
 // github.com/fgn/go-langfuse.
-//
-// Attach it where the client is constructed; call sites do not change:
 //
 //	client, err := jev.NewClient(jev.WithTracer(jevlangfuse.NewTracer(lf)))
 //
-// Each SystemOne call becomes one generation observation, parented by
-// whatever observation is in the request context, carrying the request
-// model, the state and questions as input, the answers as output, exact
-// token usage, the request ID, and the number of HTTP attempts. Everything
-// recorded flows through the core client's privacy controls: Config.Mask,
-// LANGFUSE_CONTENT_CAPTURE_ENABLED, sampling, and payload limits apply
-// unchanged. A nil or disabled Langfuse client records nothing.
+// Each call becomes one generation observation, parented by whatever
+// observation is in the request context, with the wire model, the request
+// as input, the answers as output, token usage, request ID, and attempt
+// count. Retries fold into the single generation. Everything recorded flows
+// through the core client's privacy controls (Config.Mask, content capture,
+// sampling, and payload limits). A nil or disabled Langfuse client records
+// nothing.
 package jevlangfuse
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"maps"
 	"strconv"
@@ -31,8 +30,7 @@ const DefaultObservationName = "typesafe.systemone"
 // Option configures [NewTracer].
 type Option func(*Tracer)
 
-// WithObservationName sets the generation's name. Default:
-// [DefaultObservationName].
+// WithObservationName renames the generation. Default: [DefaultObservationName].
 func WithObservationName(name string) Option {
 	return func(t *Tracer) {
 		if name != "" {
@@ -41,22 +39,22 @@ func WithObservationName(name string) Option {
 	}
 }
 
-// WithoutContentExport keeps model, usage, and metadata but never records
-// the state, questions, or answers as observation input and output.
+// WithoutContentExport records model, usage, and metadata but never the
+// request or the answers.
 func WithoutContentExport() Option {
 	return func(t *Tracer) { t.content = false }
 }
 
 // WithErrorDetails records the full error text of a failed call. By default
-// only a fixed category such as "http 429" or "timeout" is recorded, which
-// keeps server-supplied error messages out of the trace.
+// only a category such as "http 429" or "timeout" is recorded, keeping
+// server-supplied messages out of the trace.
 func WithErrorDetails() Option {
 	return func(t *Tracer) { t.errorDetails = true }
 }
 
-// WithMetadata adds static metadata to every recorded generation, for
-// example a deployment or feature label. Keys set here are overridden by the
-// per-call keys the tracer records.
+// WithMetadata adds static metadata to every generation. The tracer's own
+// keys (provider, sdk, request_model, request_id, http_status, attempts,
+// status) take precedence.
 func WithMetadata(metadata map[string]any) Option {
 	return func(t *Tracer) { maps.Copy(t.metadata, metadata) }
 }
@@ -70,8 +68,8 @@ type Tracer struct {
 	metadata     map[string]any
 }
 
-// NewTracer returns a tracer recording generations on lf. A nil lf is
-// accepted and records nothing.
+// NewTracer returns a tracer recording generations on lf; a nil lf records
+// nothing.
 func NewTracer(lf *langfuse.Client, opts ...Option) *Tracer {
 	t := &Tracer{lf: lf, name: DefaultObservationName, content: true, metadata: map[string]any{}}
 	for _, opt := range opts {
@@ -82,7 +80,9 @@ func NewTracer(lf *langfuse.Client, opts ...Option) *Tracer {
 	return t
 }
 
-type observationKey struct{}
+// observationKey is per tracer instance so composed tracers cannot
+// overwrite each other's observation.
+type observationKey struct{ tracer *Tracer }
 
 // TraceSystemOneStart starts the generation and stores it in the returned
 // context.
@@ -94,16 +94,26 @@ func (t *Tracer) TraceSystemOneStart(ctx context.Context, data jev.SystemOneStar
 	metadata["request_model"] = data.Model
 
 	attrs := langfuse.ObservationAttributes{Model: data.Model, Metadata: metadata}
-	if t.content && data.Request != nil {
-		attrs.Input = map[string]any{"state": data.Request.State, "questions": data.Request.Questions}
+	if t.content {
+		attrs.Input = wireInput(data.Body)
 	}
 	ctx, observation := t.lf.StartObservation(ctx, t.name, langfuse.TypeGeneration, attrs)
-	return context.WithValue(ctx, observationKey{}, observation)
+	return context.WithValue(ctx, observationKey{t}, observation)
+}
+
+// wireInput is the wire body without the model, which is a separate field.
+func wireInput(body json.RawMessage) any {
+	var input map[string]any
+	if json.Unmarshal(body, &input) != nil {
+		return nil
+	}
+	delete(input, "model")
+	return input
 }
 
 // TraceSystemOneEnd completes the generation started by TraceSystemOneStart.
 func (t *Tracer) TraceSystemOneEnd(ctx context.Context, data jev.SystemOneEndData) {
-	observation, _ := ctx.Value(observationKey{}).(*langfuse.Observation)
+	observation, _ := ctx.Value(observationKey{t}).(*langfuse.Observation)
 	if observation == nil {
 		return
 	}
@@ -142,8 +152,6 @@ func (t *Tracer) TraceSystemOneEnd(ctx context.Context, data jev.SystemOneEndDat
 	observation.End()
 }
 
-// failure is a fixed status category plus the request ID and HTTP status
-// when the failure was an API response.
 type failure struct {
 	status     string
 	requestID  string
@@ -157,16 +165,14 @@ func classify(err error) failure {
 	switch {
 	case errors.As(err, &apiErr):
 		return failure{"http " + strconv.Itoa(apiErr.StatusCode), apiErr.RequestID, apiErr.StatusCode}
-	case errors.As(err, &connErr) && connErr.Timeout > 0:
+	case errors.Is(err, jev.ErrTimeout):
 		return failure{status: "timeout"}
 	case errors.As(err, &connErr):
-		return failure{status: "connection error"}
+		return failure{status: "connection error", requestID: connErr.RequestID, httpStatus: connErr.StatusCode}
 	case errors.As(err, &validationErr):
 		return failure{"invalid response", validationErr.RequestID, validationErr.StatusCode}
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return failure{status: "canceled"}
-	case errors.Is(err, jev.ErrInvalidRequest):
-		return failure{status: "invalid request"}
 	default:
 		return failure{status: "error"}
 	}
