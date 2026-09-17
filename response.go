@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"iter"
+	"maps"
+	"math"
 	"net/http"
 	"strconv"
 )
@@ -220,9 +223,20 @@ type Model struct {
 }
 
 var (
-	errMissingField = errors.New("missing required field")
-	errNullValue    = errors.New("null value")
-	errOutOfRange   = errors.New("value out of range")
+	errMissingField  = errors.New("missing required field")
+	errNullValue     = errors.New("null value")
+	errOutOfRange    = errors.New("value out of range")
+	errCriteria      = errors.New("keys differ from the request criteria")
+	errDistribution  = errors.New("probabilities do not sum to 1")
+	errNotMaximum    = errors.New("not the highest-probability option")
+	errWeightedScore = errors.New("score is not the probability-weighted level")
+	errDescription   = errors.New("description must be a string, object, or array")
+)
+
+// Tolerances for values the API rounds before sending.
+const (
+	unitTolerance         = 1e-6
+	distributionTolerance = 0.05
 )
 
 func metadataOf(res result) ResponseMetadata {
@@ -236,8 +250,8 @@ func metadataOf(res result) ResponseMetadata {
 }
 
 // decodeSystemOne validates the body against the API contract and against
-// the questions that were asked.
-func decodeSystemOne(res result, kinds map[string]string) (*Response, error) {
+// the questions as they were sent.
+func decodeSystemOne(res result, specs map[string]questionSpec) (*Response, error) {
 	var wire struct {
 		Model   *string                    `json:"model"`
 		Answers map[string]json.RawMessage `json:"answers"`
@@ -270,14 +284,18 @@ func decodeSystemOne(res result, kinds map[string]string) (*Response, error) {
 		}
 		answers[name] = answer
 	}
-	for name, kind := range kinds {
+	for name, spec := range specs {
 		answer, ok := answers[name]
 		if !ok {
 			return nil, newResponseValidationError(res, "answers."+name, errMissingField)
 		}
-		if got := answerKind(answer); isKnownKind(kind) && got != kind {
+		if got := answerKind(answer); isKnownKind(spec.kind) && got != spec.kind {
 			return nil, newResponseValidationError(res, "answers."+name+".type",
-				fmt.Errorf("expected %q, got %q", kind, got))
+				fmt.Errorf("expected %q, got %q", spec.kind, got))
+		}
+		path, err := checkAnswer(answer, spec)
+		if err != nil {
+			return nil, newResponseValidationError(res, joinPath("answers."+name, path), err)
 		}
 	}
 	return &Response{
@@ -289,6 +307,56 @@ func decodeSystemOne(res result, kinds map[string]string) (*Response, error) {
 }
 
 func isKnownKind(kind string) bool { return kind == "noul" || kind == "choice" || kind == "score" }
+
+// checkAnswer verifies the answer against the criteria that were sent and
+// the API's stated invariants.
+func checkAnswer(answer Answer, spec questionSpec) (string, error) {
+	switch a := answer.(type) {
+	case ChoiceAnswer:
+		if len(a.Probabilities) != len(spec.options) {
+			return "probabilities", errCriteria
+		}
+		best := -1.0
+		for option, probability := range a.Probabilities {
+			if _, ok := spec.options[option]; !ok {
+				return "probabilities." + option, errCriteria
+			}
+			best = math.Max(best, probability)
+		}
+		if a.Probabilities[a.Choice] < best-unitTolerance {
+			return "choice", errNotMaximum
+		}
+		if !sumsToOne(maps.Values(a.Probabilities)) {
+			return "probabilities", errDistribution
+		}
+	case ScoreAnswer:
+		if len(a.Probabilities) != spec.levels {
+			return "probabilities", errCriteria
+		}
+		weighted := 0.0
+		for level, probability := range a.Probabilities {
+			if level >= spec.levels {
+				return "probabilities." + strconv.Itoa(level), errCriteria
+			}
+			weighted += float64(level) * probability
+		}
+		if !sumsToOne(maps.Values(a.Probabilities)) {
+			return "probabilities", errDistribution
+		}
+		if math.Abs(a.Score-weighted) > distributionTolerance {
+			return "score", errWeightedScore
+		}
+	}
+	return "", nil
+}
+
+func sumsToOne(values iter.Seq[float64]) bool {
+	sum := 0.0
+	for value := range values {
+		sum += value
+	}
+	return math.Abs(sum-1) <= distributionTolerance
+}
 
 func answerKind(a Answer) string {
 	switch v := a.(type) {
@@ -411,6 +479,11 @@ func decodeScore(raw json.RawMessage) (Answer, string, error) {
 		if err != nil || description == nil {
 			return nil, "legend." + key, errNullValue
 		}
+		switch description.(type) {
+		case string, map[string]any, []any:
+		default:
+			return nil, "legend." + key, errDescription
+		}
 		legendValues[key] = description
 	}
 	legend, path, err := levelKeys(legendValues)
@@ -425,7 +498,7 @@ func decodeScore(raw json.RawMessage) (Answer, string, error) {
 			return nil, "legend." + strconv.Itoa(level), errors.New("level missing from probabilities")
 		}
 	}
-	if *w.Score < -1e-6 || *w.Score > float64(len(legend)-1)+1e-6 {
+	if *w.Score < -unitTolerance || *w.Score > float64(len(legend)-1)+unitTolerance {
 		return nil, "score", errOutOfRange
 	}
 	return ScoreAnswer{
@@ -436,7 +509,7 @@ func decodeScore(raw json.RawMessage) (Answer, string, error) {
 	}, "", nil
 }
 
-func inUnitRange(v float64) bool { return v >= -1e-6 && v <= 1+1e-6 }
+func inUnitRange(v float64) bool { return v >= -unitTolerance && v <= 1+unitTolerance }
 
 func probabilityMap(in map[string]*float64) (map[string]float64, string, error) {
 	out := make(map[string]float64, len(in))

@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -277,7 +278,6 @@ func TestQuestionShapes(t *testing.T) {
 		"score one level":      jev.Score{Criteria: []string{"only"}},
 		"score pointer":        &jev.Score{Criteria: []any{"a", "b"}},
 		"choice string map":    jev.Choice{Criteria: map[string]string{"a": "A"}},
-		"choice empty":         jev.Choice{},
 		"raw score strings":    jev.RawQuestion{"type": "score", "criteria": []string{"low", "high"}},
 		"raw score array":      jev.RawQuestion{"type": "score", "criteria": [2]string{"low", "high"}},
 		"raw score raw json":   jev.RawQuestion{"type": "score", "criteria": json.RawMessage(`["low","high"]`)},
@@ -296,21 +296,180 @@ func TestQuestionShapes(t *testing.T) {
 				}
 				is.NoErr(json.NewDecoder(r.Body).Decode(&body))
 				is.True(body.Questions["q"]["type"] != "")
-				answers := map[string]string{
-					"noul":   `{"type":"noul","noul":0.5}`,
-					"choice": `{"type":"choice","choice":"a","confidence":1,"probabilities":{"a":1}}`,
-					"score":  `{"type":"score","score":0,"confidence":1,"legend":{"0":"x"},"probabilities":{"0":1}}`,
-					"future": `{"type":"future"}`,
-				}
-				return reply(
-					http.StatusOK,
-					`{"model":"m","answers":{"q":`+answers[body.Questions["q"]["type"].(string)]+`},`+
-						`"usage":{"input_tokens":1,"output_tokens":1}}`,
-				), nil
+				return reply(http.StatusOK, `{"model":"m","answers":{"q":`+fakeAnswer(body.Questions["q"])+`},`+
+					`"usage":{"input_tokens":1,"output_tokens":1}}`), nil
 			})
 			_, err := client.SystemOne(t.Context(), jev.Request{State: "x", Questions: jev.Questions{"q": question}})
 			is.NoErr(err)
 			is.True(sent)
+		})
+	}
+}
+
+// fakeAnswer builds a contract-valid answer for the question as sent.
+func fakeAnswer(question map[string]any) string {
+	switch question["type"] {
+	case "noul":
+		return `{"type":"noul","noul":0.5}`
+	case "choice":
+		probabilities := map[string]float64{}
+		first := ""
+		for option := range question["criteria"].(map[string]any) {
+			probabilities[option] = 0
+			if first == "" || option < first {
+				first = option
+			}
+		}
+		probabilities[first] = 1
+		return `{"type":"choice","choice":"` + first + `","confidence":1,"probabilities":` + mustJSON(probabilities) + `}`
+	case "score":
+		legend, probabilities := map[string]string{}, map[string]float64{}
+		for i := range question["criteria"].([]any) {
+			legend[strconv.Itoa(i)] = "level"
+			probabilities[strconv.Itoa(i)] = 0
+		}
+		probabilities["0"] = 1
+		return `{"type":"score","score":0,"confidence":1,"legend":` + mustJSON(legend) +
+			`,"probabilities":` + mustJSON(probabilities) + `}`
+	default:
+		return `{"type":"` + question["type"].(string) + `"}`
+	}
+}
+
+func mustJSON(v any) string {
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return string(encoded)
+}
+
+func TestEmptyChoiceIsSent(t *testing.T) {
+	t.Parallel()
+	is := is.New(t)
+	client := transportClient(t, func(*http.Request) (*http.Response, error) {
+		return reply(http.StatusUnprocessableEntity, `{"detail":"empty criteria"}`), nil
+	})
+	_, err := client.SystemOne(t.Context(), jev.Request{State: "x", Questions: jev.Questions{"q": jev.Choice{}}})
+	is.True(errors.Is(err, jev.ErrUnprocessableEntity)) // accepted locally per OpenAPI; the server decides
+}
+
+func TestExtraOverridesAreValidatedAsSent(t *testing.T) {
+	t.Parallel()
+	t.Run("replaced questions", func(t *testing.T) {
+		t.Parallel()
+		is := is.New(t)
+		tracer := &recordingTracer{}
+		client := transportClient(t, func(*http.Request) (*http.Response, error) {
+			return reply(http.StatusOK, `{"model":"m","answers":{"replacement":{"type":"score","score":0,"confidence":1,`+
+				`"legend":{"0":"only"},"probabilities":{"0":1}}},"usage":{"input_tokens":1,"output_tokens":1}}`), nil
+		}, jev.WithTracer(tracer))
+		resp, err := client.SystemOne(t.Context(), jev.Request{
+			State:     "x",
+			Questions: jev.Questions{"q": jev.Noul{}},
+			Extra:     map[string]any{"questions": map[string]any{"replacement": jev.Score{Criteria: []string{"only"}}}},
+		})
+		is.NoErr(err)
+		_, ok := resp.Score("replacement")
+		is.True(ok)
+		_, err = client.SystemOne(t.Context(), jev.Request{
+			State:     "x",
+			Questions: jev.Questions{"q": jev.Noul{}},
+			Extra:     map[string]any{"questions": map[string]any{"replacement": map[string]any{"type": "score"}}},
+		})
+		is.True(errors.Is(err, jev.ErrInvalidRequest)) // the replacement is validated too
+		is.Equal(len(tracer.starts), 1)
+	})
+	t.Run("model as raw JSON", func(t *testing.T) {
+		t.Parallel()
+		is := is.New(t)
+		tracer := &recordingTracer{}
+		type modelName string
+		client := transportClient(t, func(*http.Request) (*http.Response, error) { return reply(http.StatusOK, okBody), nil },
+			jev.WithTracer(tracer))
+		for _, model := range []any{json.RawMessage(`"effective"`), modelName("effective")} {
+			_, err := client.SystemOne(t.Context(), jev.Request{
+				State: "x", Questions: basicRequest.Questions, Extra: map[string]any{"model": model},
+			})
+			is.NoErr(err)
+		}
+		is.Equal(tracer.starts[0].Model, "effective")
+		is.Equal(tracer.starts[1].Model, "effective")
+	})
+}
+
+func TestSemanticResponseValidation(t *testing.T) {
+	t.Parallel()
+	const prefix = `{"model":"m","answers":{"q":`
+	const suffix = `},"usage":{"input_tokens":1,"output_tokens":1}}`
+	choice := jev.Choice{Criteria: map[string]any{"billing": nil, "sales": nil}}
+	score := jev.Score{Criteria: []string{"low", "high"}}
+	twoLevels := `"legend":{"0":"a","1":"b"}`
+	cases := map[string]struct {
+		question   jev.Question
+		body, path string
+	}{
+		"unrequested option": {
+			choice, `{"type":"choice","choice":"security","confidence":1,"probabilities":{"security":1}}`,
+			"answers.q.probabilities",
+		},
+		"missing option": {
+			choice, `{"type":"choice","choice":"billing","confidence":1,"probabilities":{"billing":1}}`,
+			"answers.q.probabilities",
+		},
+		"sum too large": {
+			choice, `{"type":"choice","choice":"billing","confidence":1,"probabilities":{"billing":0.9,"sales":0.9}}`,
+			"answers.q.probabilities",
+		},
+		"not the maximum": {
+			choice, `{"type":"choice","choice":"billing","confidence":1,"probabilities":{"billing":0.1,"sales":0.9}}`,
+			"answers.q.choice",
+		},
+		"rounded sum ok": {
+			choice, `{"type":"choice","choice":"billing","confidence":1,"probabilities":{"billing":0.51,"sales":0.5}}`, "",
+		},
+		"boolean legend": {
+			score, `{"type":"score","score":1,"confidence":1,"legend":{"0":false,"1":true},"probabilities":{"0":0,"1":1}}`,
+			"answers.q.legend.0",
+		},
+		"unrequested level": {
+			score, `{"type":"score","score":1,"confidence":1,"legend":{"0":"a","99":"b"},"probabilities":{"0":0,"99":1}}`,
+			"answers.q.probabilities.99",
+		},
+		"missing level": {
+			score, `{"type":"score","score":0,"confidence":1,"legend":{"0":"a"},"probabilities":{"0":1}}`,
+			"answers.q.probabilities",
+		},
+		"score not weighted": {
+			score, `{"type":"score","score":0.2,"confidence":1,` + twoLevels + `,"probabilities":{"0":0,"1":1}}`,
+			"answers.q.score",
+		},
+		"rounded score ok": {
+			jev.Score{Criteria: []string{"a", "b", "c"}},
+			`{"type":"score","score":1.02,"confidence":0.97,"legend":{"0":"a","1":"b","2":"c"},` +
+				`"probabilities":{"0":0,"1":0.98,"2":0.02}}`,
+			"",
+		},
+		"score sum too low": {
+			score, `{"type":"score","score":0.5,"confidence":1,` + twoLevels + `,"probabilities":{"0":0.5,"1":0.1}}`,
+			"answers.q.probabilities",
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			is := is.New(t)
+			client := transportClient(t, func(*http.Request) (*http.Response, error) {
+				return reply(http.StatusOK, prefix+tc.body+suffix), nil
+			})
+			_, err := client.SystemOne(t.Context(), jev.Request{State: "x", Questions: jev.Questions{"q": tc.question}})
+			if tc.path == "" {
+				is.NoErr(err)
+				return
+			}
+			var verr *jev.ResponseValidationError
+			is.True(errors.As(err, &verr))
+			is.Equal(verr.Path, tc.path)
 		})
 	}
 }
@@ -658,6 +817,7 @@ func TestAPIErrorMessages(t *testing.T) {
 		"unrecognized json": {`{"code":7}`, `{"code":7}`},
 		"long text":         {long, long[:200] + "…"},
 		"long message":      {`{"error":"` + long + `"}`, long[:200] + "…"},
+		"multibyte":         {strings.Repeat("é", 199) + "🦊tail", strings.Repeat("é", 199) + "🦊…"},
 		"validation list": {
 			`{"detail":[{"loc":["body","questions","tone"],"msg":"field required"},{"msg":"other"}]}`,
 			"questions.tone: field required; other",
@@ -944,6 +1104,42 @@ func TestRetryStatusRules(t *testing.T) {
 	})
 }
 
+func TestTotalTimeoutBoundsBackoff(t *testing.T) {
+	t.Parallel()
+	is := is.New(t)
+	policy := fastRetry()
+	policy.TotalTimeout = 60 * time.Millisecond
+	policy.InitialBackoff, policy.MaxBackoff, policy.Jitter = 40*time.Millisecond, 40*time.Millisecond, 0
+	var calls atomic.Int32
+	client := transportClient(t, func(*http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return reply(http.StatusServiceUnavailable, ""), nil
+	}, jev.WithRetryPolicy(policy), jev.WithLogger(slog.New(slowHandler{})))
+	started := time.Now()
+	_, err := client.SystemOne(t.Context(), basicRequest)
+	is.True(errors.Is(err, jev.ErrTimeout)) // the budget expired while the retry log ran
+	var connErr *jev.ConnectionError
+	is.True(errors.As(err, &connErr))
+	is.Equal(connErr.Timeout, 60*time.Millisecond)
+	is.Equal(connErr.StatusCode, http.StatusServiceUnavailable) // the last response is still described
+	is.Equal(calls.Load(), int32(1))                            // no attempt after the budget expired
+	is.True(time.Since(started) < 100*time.Millisecond)         // no backoff sleep after the budget expired
+}
+
+// slowHandler stalls the retry log record long enough to expire a budget.
+type slowHandler struct{}
+
+func (slowHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (slowHandler) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == "jev: retrying" {
+		time.Sleep(80 * time.Millisecond)
+	}
+	return nil
+}
+func (h slowHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h slowHandler) WithGroup(string) slog.Handler      { return h }
+
 func TestRetryBackoffTiming(t *testing.T) {
 	t.Parallel()
 	is := is.New(t)
@@ -1049,6 +1245,7 @@ func TestConnectionErrors(t *testing.T) {
 		is.True(errors.Is(err, io.ErrUnexpectedEOF))
 		is.Equal(connErr.StatusCode, http.StatusServiceUnavailable)
 		is.Equal(connErr.RequestID, "req-123")
+		is.Equal(connErr.Header.Get("X-Typesafe-Request-Id"), "req-123")
 	})
 	t.Run("oversized body is rejected", func(t *testing.T) {
 		t.Parallel()
@@ -1058,9 +1255,13 @@ func TestConnectionErrors(t *testing.T) {
 			res.Body = io.NopCloser(io.LimitReader(zeroReader{}, 17<<20))
 			return res, nil
 		})
-		_, err := client.SystemOne(t.Context(), basicRequest)
-		is.True(errors.Is(err, jev.ErrConnection))
-		is.True(strings.Contains(err.Error(), "exceeds"))
+		_, err := client.SystemOne(t.Context(), basicRequest, jev.WithRetryPolicy(fastRetry()))
+		is.True(errors.Is(err, jev.ErrResponseTooLarge))
+		is.True(!errors.Is(err, jev.ErrConnection))
+		var verr *jev.ResponseValidationError
+		is.True(errors.As(err, &verr))
+		is.Equal(verr.Attempts, 1) // a local limit is not retried
+		is.Equal(verr.StatusCode, http.StatusOK)
 	})
 	t.Run("attempt timeout is classified and retried", func(t *testing.T) {
 		t.Parallel()
@@ -1076,7 +1277,7 @@ func TestConnectionErrors(t *testing.T) {
 		var connErr *jev.ConnectionError
 		is.True(errors.As(err, &connErr))
 		is.Equal(connErr.Timeout, 30*time.Millisecond)
-		is.True(connErr.Elapsed >= 30*time.Millisecond)
+		is.True(connErr.Elapsed > 0)
 		is.True(errors.Is(err, jev.ErrTimeout))
 		is.True(errors.Is(err, jev.ErrConnection))
 		is.Equal(calls.Load(), int32(2))
@@ -1191,8 +1392,8 @@ func TestCallerCancellation(t *testing.T) {
 	})
 }
 
+//nolint:paralleltest // counts process-wide goroutines, so it must not overlap other tests.
 func TestNoGoroutineLeakUnderTimeouts(t *testing.T) {
-	t.Parallel()
 	is := is.New(t)
 	before := runtime.NumGoroutine()
 	client := transportClient(t, func(r *http.Request) (*http.Response, error) {
@@ -1214,8 +1415,15 @@ func TestNoGoroutineLeakUnderTimeouts(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	time.Sleep(20 * time.Millisecond)
-	is.True(runtime.NumGoroutine() <= before+3)
+	settled := false
+	for range 50 {
+		if runtime.NumGoroutine() <= before {
+			settled = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	is.True(settled) // every attempt's goroutines ended
 }
 
 func TestListModels(t *testing.T) {

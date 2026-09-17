@@ -1,7 +1,6 @@
 package jev
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -122,13 +121,20 @@ func (q RawQuestion) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]any(q))
 }
 
-// encodedRequest is a validated wire body with what tracing and decoding
-// need to know about it.
+// questionSpec is what the decoder checks an answer against, taken from
+// the question as it appears on the wire.
+type questionSpec struct {
+	kind    string
+	options map[string]struct{} // choice options
+	levels  int                 // score levels
+}
+
+// encodedRequest is the wire body plus what tracing and decoding need to
+// know about it, all derived from the same bytes that are sent.
 type encodedRequest struct {
 	body  []byte
 	model string
-	// kinds maps each question name to its wire type.
-	kinds map[string]string
+	specs map[string]questionSpec
 }
 
 func (r Request) encode(defaultModel string) (encodedRequest, error) {
@@ -136,7 +142,6 @@ func (r Request) encode(defaultModel string) (encodedRequest, error) {
 		return encodedRequest{}, fmt.Errorf("%w: at least one question is required", ErrInvalidRequest)
 	}
 	questions := make(map[string]json.RawMessage, len(r.Questions))
-	kinds := make(map[string]string, len(r.Questions))
 	for _, name := range slices.Sorted(maps.Keys(r.Questions)) {
 		question := r.Questions[name]
 		if isNilQuestion(question) {
@@ -146,12 +151,7 @@ func (r Request) encode(defaultModel string) (encodedRequest, error) {
 		if err != nil {
 			return encodedRequest{}, fmt.Errorf("%w: question %q: %w", ErrInvalidRequest, name, err)
 		}
-		kind, err := validateQuestion(name, raw)
-		if err != nil {
-			return encodedRequest{}, err
-		}
 		questions[name] = raw
-		kinds[name] = kind
 	}
 	model := r.Model
 	if model == "" {
@@ -162,14 +162,40 @@ func (r Request) encode(defaultModel string) (encodedRequest, error) {
 	}
 	body := map[string]any{"state": r.State, "model": model, "questions": questions}
 	maps.Copy(body, r.Extra)
-	if override, ok := body["model"].(string); ok {
-		model = override
-	}
 	encoded, err := json.Marshal(body)
 	if err != nil {
 		return encodedRequest{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
-	return encodedRequest{body: encoded, model: model, kinds: kinds}, nil
+	return inspectRequest(encoded)
+}
+
+// inspectRequest validates the wire body and extracts the effective model
+// and question specs, so Extra overrides are checked and traced as sent.
+func inspectRequest(encoded []byte) (encodedRequest, error) {
+	var wire struct {
+		Model     json.RawMessage            `json:"model"`
+		Questions map[string]json.RawMessage `json:"questions"`
+	}
+	err := json.Unmarshal(encoded, &wire)
+	if err != nil {
+		return encodedRequest{}, fmt.Errorf("%w: %w", ErrInvalidRequest, err)
+	}
+	if len(wire.Questions) == 0 {
+		return encodedRequest{}, fmt.Errorf("%w: at least one question is required", ErrInvalidRequest)
+	}
+	specs := make(map[string]questionSpec, len(wire.Questions))
+	for _, name := range slices.Sorted(maps.Keys(wire.Questions)) {
+		spec, err := inspectQuestion(name, wire.Questions[name])
+		if err != nil {
+			return encodedRequest{}, err
+		}
+		specs[name] = spec
+	}
+	var model string
+	if json.Unmarshal(wire.Model, &model) != nil {
+		model = ""
+	}
+	return encodedRequest{body: encoded, model: model, specs: specs}, nil
 }
 
 // isNilQuestion also catches typed nil pointers and nil maps, which satisfy
@@ -182,31 +208,35 @@ func isNilQuestion(q Question) bool {
 	return (v.Kind() == reflect.Pointer || v.Kind() == reflect.Map) && v.IsNil()
 }
 
-// validateQuestion checks the encoded JSON rather than Go types, so raw and
-// typed questions follow the same rules.
-func validateQuestion(name string, raw []byte) (string, error) {
+func inspectQuestion(name string, raw json.RawMessage) (questionSpec, error) {
 	var wire struct {
 		Type     string          `json:"type"`
 		Criteria json.RawMessage `json:"criteria"`
 	}
 	err := json.Unmarshal(raw, &wire)
 	if err != nil {
-		return "", fmt.Errorf("%w: question %q: %w", ErrInvalidRequest, name, err)
+		return questionSpec{}, fmt.Errorf("%w: question %q: %w", ErrInvalidRequest, name, err)
 	}
-	if wire.Type == "" {
-		return "", fmt.Errorf("%w: question %q needs a non-empty string \"type\"", ErrInvalidRequest, name)
-	}
-	criteria := bytes.TrimSpace(wire.Criteria)
+	spec := questionSpec{kind: wire.Type}
 	switch wire.Type {
+	case "":
+		return questionSpec{}, fmt.Errorf("%w: question %q needs a non-empty string \"type\"", ErrInvalidRequest, name)
 	case "choice":
-		if !bytes.HasPrefix(criteria, []byte("{")) {
-			return "", fmt.Errorf("%w: question %q: choice criteria must be a JSON object", ErrInvalidRequest, name)
+		var options map[string]json.RawMessage
+		if json.Unmarshal(wire.Criteria, &options) != nil || options == nil {
+			return questionSpec{}, fmt.Errorf("%w: question %q: choice criteria must be a JSON object", ErrInvalidRequest, name)
+		}
+		spec.options = make(map[string]struct{}, len(options))
+		for option := range options {
+			spec.options[option] = struct{}{}
 		}
 	case "score":
 		var levels []json.RawMessage
-		if json.Unmarshal(criteria, &levels) != nil || len(levels) == 0 {
-			return "", fmt.Errorf("%w: question %q: score criteria must be a nonempty JSON array", ErrInvalidRequest, name)
+		if json.Unmarshal(wire.Criteria, &levels) != nil || len(levels) == 0 {
+			return questionSpec{}, fmt.Errorf("%w: question %q: score criteria must be a nonempty JSON array",
+				ErrInvalidRequest, name)
 		}
+		spec.levels = len(levels)
 	}
-	return wire.Type, nil
+	return spec, nil
 }

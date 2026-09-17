@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/fgn/go-langfuse"
 	"github.com/matryer/is"
@@ -70,6 +71,34 @@ func attributes(span sdktrace.ReadOnlySpan) map[string]string {
 		out[string(kv.Key)] = kv.Value.String()
 	}
 	return out
+}
+
+func TestSameTracerComposedTwiceEndsBoth(t *testing.T) {
+	t.Parallel()
+	is := is.New(t)
+	lf, recorder := newLangfuse(t)
+	tracer := jevlangfuse.NewTracer(lf)
+	client := newClient(t, http.StatusOK, okBody, jev.MultiTracer(tracer, tracer))
+	_, err := client.SystemOne(t.Context(), request)
+	is.NoErr(err)
+	is.Equal(len(recorder.Started()), 2)
+	is.Equal(len(recorder.Ended()), 2)
+	is.Equal(recorder.Ended()[0].Parent().SpanID(), recorder.Ended()[1].SpanContext().SpanID()) // inner ended first
+}
+
+func TestTimeoutAfterHeadersKeepsMetadata(t *testing.T) {
+	t.Parallel()
+	is := is.New(t)
+	lf, recorder := newLangfuse(t)
+	tracer := jevlangfuse.NewTracer(lf)
+	ctx := tracer.TraceSystemOneStart(t.Context(), jev.SystemOneStartData{Model: "m", Body: []byte(`{}`)})
+	tracer.TraceSystemOneEnd(ctx, jev.SystemOneEndData{Attempts: 1, Err: &jev.ConnectionError{
+		Timeout: time.Second, StatusCode: http.StatusServiceUnavailable, RequestID: "known-id", Err: context.DeadlineExceeded,
+	}})
+	attrs := attributes(recorder.Ended()[0])
+	is.Equal(attrs["langfuse.observation.metadata.status"], "timeout")
+	is.Equal(attrs["langfuse.observation.metadata.request_id"], "known-id")
+	is.Equal(attrs["langfuse.observation.metadata.http_status"], "503")
 }
 
 func TestComposedTracersEndTheirOwnObservations(t *testing.T) {

@@ -44,6 +44,10 @@ var (
 	ErrTimeout = errors.New("jev: request timed out")
 )
 
+// ErrResponseTooLarge is the Err of a [*ResponseValidationError] for a
+// response body over 16 MiB. It is never retried.
+var ErrResponseTooLarge = errors.New("jev: response body exceeds 16 MiB")
+
 // APIError is an unsuccessful HTTP response, returned after any retries.
 // It matches the status sentinels through errors.Is:
 //
@@ -56,7 +60,8 @@ type APIError struct {
 	// Body is the raw response body, or nil when empty.
 	Body []byte
 	// Message is the server's message extracted from Body, or the body
-	// itself, truncated to 200 characters.
+	// itself, truncated to 200 characters. It can contain anything the
+	// server reflected, including request data.
 	Message string
 	// RequestID is the X-Typesafe-Request-Id header, or empty when absent.
 	RequestID string
@@ -131,9 +136,10 @@ type ConnectionError struct {
 	// [RetryPolicy.TotalTimeout]. It is zero when the failure was not an SDK
 	// timeout, including timeouts raised by the transport itself.
 	Timeout time.Duration
-	// StatusCode and RequestID are set when the response headers arrived
-	// before the body failed.
+	// StatusCode, Header, and RequestID are set when the response headers
+	// arrived before the body failed.
 	StatusCode int
+	Header     http.Header
 	RequestID  string
 	Attempts   int
 	Err        error
@@ -209,11 +215,17 @@ func (e *ResponseValidationError) Error() string {
 
 func (e *ResponseValidationError) Unwrap() error { return e.Err }
 
+// truncate keeps at most maxMessageLength characters, cutting on a rune
+// boundary.
 func truncate(s string) string {
-	if len(s) <= maxMessageLength {
-		return s
+	count := 0
+	for i := range s {
+		if count == maxMessageLength {
+			return s[:i] + "…"
+		}
+		count++
 	}
-	return s[:maxMessageLength] + "…"
+	return s
 }
 
 // describeBody extracts a message the way the official SDKs do: a plain

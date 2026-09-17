@@ -16,8 +16,6 @@ import (
 // maxResponseBytes bounds memory per response; API bodies are kilobytes.
 const maxResponseBytes = 16 << 20
 
-var errResponseTooLarge = errors.New("response body exceeds 16 MiB")
-
 // result is the outcome of the last HTTP attempt of a call.
 type result struct {
 	method   string
@@ -45,6 +43,10 @@ func (c *config) do(ctx context.Context, method, path string, body []byte) (resu
 		if err != nil {
 			return res, c.contextError(res, err)
 		}
+		err = callCtx.Err()
+		if err != nil {
+			return res, c.budgetError(res, started, err)
+		}
 		err = c.attempt(ctx, callCtx, &res, body, attempt)
 		if err == nil {
 			return res, nil
@@ -66,10 +68,22 @@ func (c *config) do(ctx context.Context, method, path string, body []byte) (resu
 			slog.String("method", method), slog.String("url", res.url), slog.Duration("delay", delay),
 			slog.Int("retry", attempt+1), slog.Int("max_retries", policy.MaxRetries),
 			slog.String("reason", retryReason(err)))
-		err = sleep(ctx, delay)
+		err = sleep(callCtx, delay)
 		if err != nil {
-			return res, c.contextError(res, err)
+			if ctx.Err() != nil {
+				return res, c.contextError(res, ctx.Err())
+			}
+			return res, c.budgetError(res, started, err)
 		}
+	}
+}
+
+// budgetError reports an expired TotalTimeout outside an attempt.
+func (c *config) budgetError(res result, started time.Time, err error) error {
+	return &ConnectionError{
+		Method: res.method, URL: res.url, Elapsed: time.Since(started), Timeout: c.retry.TotalTimeout,
+		StatusCode: res.status, Header: res.header, RequestID: res.header.Get(requestIDHeader),
+		Attempts: res.attempts, Err: err,
 	}
 }
 
@@ -105,6 +119,9 @@ func (c *config) attempt(ctx, callCtx context.Context, res *result, body []byte,
 		res.body, err = readBody(httpRes.Body)
 	}
 	elapsed := time.Since(started)
+	if errors.Is(err, ErrResponseTooLarge) {
+		return newResponseValidationError(*res, "", err)
+	}
 	if err != nil {
 		ctxErr := ctx.Err()
 		if ctxErr != nil {
@@ -113,7 +130,7 @@ func (c *config) attempt(ctx, callCtx context.Context, res *result, body []byte,
 			return c.contextError(*res, ctxErr)
 		}
 		connErr := &ConnectionError{
-			Method: res.method, URL: res.url, Elapsed: elapsed, StatusCode: res.status,
+			Method: res.method, URL: res.url, Elapsed: elapsed, StatusCode: res.status, Header: res.header,
 			RequestID: res.header.Get(requestIDHeader), Attempts: res.attempts, Err: err,
 		}
 		switch {
@@ -149,7 +166,7 @@ func readBody(body io.ReadCloser) ([]byte, error) {
 		return nil, err
 	}
 	if len(data) > maxResponseBytes {
-		return nil, errResponseTooLarge
+		return nil, ErrResponseTooLarge
 	}
 	return data, nil
 }

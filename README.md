@@ -103,9 +103,12 @@ slices, or structs with `json` tags, so a `[]string` of levels or a
 `map[string]string` of options works as is. `jev.RawQuestion` sends a
 question verbatim for fields this version does not model, and `Request.Extra`
 adds top-level request fields. `Response.RawBody` keeps the complete response.
-Responses are validated against the API contract and the questions asked: a
-missing answer, a null probability, or a level key that is not an index is a
-`*jev.ResponseValidationError` rather than a silent zero.
+Responses are validated against the API contract and the questions as sent,
+including `Request.Extra` overrides: a missing answer, an option or level
+that was not asked for, a null probability, a distribution that does not sum
+to one, or a choice that is not the most probable option is a
+`*jev.ResponseValidationError` rather than a silent zero. Sums and weighted
+scores allow for the API's rounding.
 
 `Request` and `Response` are not the wire format; the client encodes and
 decodes them. Individual questions and answers marshal to their wire JSON.
@@ -155,7 +158,7 @@ case errors.Is(err, jev.ErrTimeout):
 case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 	// the caller's context
 case errors.Is(err, jev.ErrInvalidRequest):
-	// rejected before sending: no questions, a Score with fewer than two levels, ...
+	// rejected before sending: no questions, a Score without levels, a typed nil question, ...
 }
 
 var apiErr *jev.APIError
@@ -165,16 +168,22 @@ if errors.As(err, &apiErr) {
 ```
 
 A successful response that does not match the API contract is a
-`*jev.ResponseValidationError` naming the offending field. Every error and
-response carries the request ID and the number of HTTP attempts made.
-Error messages never contain the API key; debug logs contain request and
-response bodies, so enable them deliberately.
+`*jev.ResponseValidationError` naming the offending field, including a body
+over 16 MiB (`ErrResponseTooLarge`), which is never retried. API,
+connection, and validation errors and every response carry the request ID
+and the number of HTTP attempts made; errors raised before a request is
+sent, and the caller's own context errors, do not.
+
+Credential headers are redacted from logs. Server messages in `APIError`
+and debug-level bodies may contain whatever the server or your state
+included, so treat them as sensitive.
 
 ## Instrumentation
 
-`jev.Tracer` observes every `SystemOne` call with typed start and end data,
-and the context it returns is used for the HTTP requests, so spans parent
-correctly. The [contrib/langfuse](contrib/langfuse) module records one
+`jev.Tracer` observes every `SystemOne` call that passes local validation,
+with the wire body and effective model at start and the decoded response,
+error, and attempt count at end. The context it returns is used for the
+HTTP requests, so spans parent correctly. The [contrib/langfuse](contrib/langfuse) module records one
 Langfuse generation per call with model, input, output, token usage, request
 ID, and attempt count:
 
@@ -193,7 +202,7 @@ OpenAPI schema, and defaults match the official SDKs. Known differences:
 | Behavior | This client | Python | TypeScript |
 | --- | --- | --- | --- |
 | Score with one level | accepted (OpenAPI `minItems: 1`) | accepted | rejected |
-| Missing or null response fields | validation error | validation error | passed through |
+| Missing or null response fields | validation error | validation error, except usage counters | passed through |
 | Unknown answer kinds | `UnknownAnswer` with raw JSON | skipped | passed through |
 | `Retry-After` above 60s | falls back to backoff | honored, 30s call budget | falls back to backoff |
 | Total call budget | off by default | 30s by default | none |
@@ -214,5 +223,6 @@ task test:live   # exercises the real API with TYPESAFE_API_KEY
 ```
 
 Behavior follows the [TypeSafe API reference](https://docs.typesafe.ai/api)
-and the official SDKs; the defaults for timeouts, retries, and headers match
-theirs so that switching between SDKs is not a behavior change.
+and the OpenAPI schema; defaults for timeouts, retries, and headers match the
+official SDKs, and the [compatibility table](#compatibility) lists the
+differences.

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"maps"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/fgn/go-langfuse"
 	jev "github.com/fgn/jevgo"
@@ -84,6 +85,23 @@ func NewTracer(lf *langfuse.Client, opts ...Option) *Tracer {
 // overwrite each other's observation.
 type observationKey struct{ tracer *Tracer }
 
+// observationNode links the observations one tracer started under a
+// context, so a tracer composed twice ends both, newest first.
+type observationNode struct {
+	observation *langfuse.Observation
+	parent      *observationNode
+	ended       atomic.Bool
+}
+
+func (n *observationNode) pop() *langfuse.Observation {
+	for ; n != nil; n = n.parent {
+		if n.ended.CompareAndSwap(false, true) {
+			return n.observation
+		}
+	}
+	return nil
+}
+
 // TraceSystemOneStart starts the generation and stores it in the returned
 // context.
 func (t *Tracer) TraceSystemOneStart(ctx context.Context, data jev.SystemOneStartData) context.Context {
@@ -97,8 +115,9 @@ func (t *Tracer) TraceSystemOneStart(ctx context.Context, data jev.SystemOneStar
 	if t.content {
 		attrs.Input = wireInput(data.Body)
 	}
+	parent, _ := ctx.Value(observationKey{t}).(*observationNode)
 	ctx, observation := t.lf.StartObservation(ctx, t.name, langfuse.TypeGeneration, attrs)
-	return context.WithValue(ctx, observationKey{t}, observation)
+	return context.WithValue(ctx, observationKey{t}, &observationNode{observation: observation, parent: parent})
 }
 
 // wireInput is the wire body without the model, which is a separate field.
@@ -113,7 +132,8 @@ func wireInput(body json.RawMessage) any {
 
 // TraceSystemOneEnd completes the generation started by TraceSystemOneStart.
 func (t *Tracer) TraceSystemOneEnd(ctx context.Context, data jev.SystemOneEndData) {
-	observation, _ := ctx.Value(observationKey{t}).(*langfuse.Observation)
+	node, _ := ctx.Value(observationKey{t}).(*observationNode)
+	observation := node.pop()
 	if observation == nil {
 		return
 	}
@@ -165,10 +185,14 @@ func classify(err error) failure {
 	switch {
 	case errors.As(err, &apiErr):
 		return failure{"http " + strconv.Itoa(apiErr.StatusCode), apiErr.RequestID, apiErr.StatusCode}
+	case errors.As(err, &connErr):
+		status := "connection error"
+		if errors.Is(err, jev.ErrTimeout) {
+			status = "timeout"
+		}
+		return failure{status, connErr.RequestID, connErr.StatusCode}
 	case errors.Is(err, jev.ErrTimeout):
 		return failure{status: "timeout"}
-	case errors.As(err, &connErr):
-		return failure{status: "connection error", requestID: connErr.RequestID, httpStatus: connErr.StatusCode}
 	case errors.As(err, &validationErr):
 		return failure{"invalid response", validationErr.RequestID, validationErr.StatusCode}
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):

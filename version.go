@@ -6,7 +6,7 @@ import (
 )
 
 // Version is sent in the User-Agent and X-Typesafe-Sdk headers.
-const Version = "0.2.0"
+const Version = "0.3.0"
 
 var (
 	userAgent          = "jevgo/" + Version

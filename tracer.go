@@ -36,7 +36,8 @@ type SystemOneEndData struct {
 
 // MultiTracer composes tracers. Start contexts chain in order, so each
 // tracer sees values set by the ones before it; End runs in reverse order
-// with the context returned by the last Start.
+// with the context returned by the last Start. A tracer listed more than
+// once must cope with being started twice under the same context.
 func MultiTracer(tracers ...Tracer) Tracer {
 	filtered := make([]Tracer, 0, len(tracers))
 	for _, t := range tracers {

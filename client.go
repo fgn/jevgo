@@ -230,7 +230,7 @@ func (c *Client) SystemOne(ctx context.Context, req Request, opts ...Option) (*R
 	res, err := cfg.do(ctx, http.MethodPost, systemOnePath, encoded.body)
 	var resp *Response
 	if err == nil {
-		resp, err = decodeSystemOne(res, encoded.kinds)
+		resp, err = decodeSystemOne(res, encoded.specs)
 	}
 	if cfg.tracer != nil {
 		cfg.tracer.TraceSystemOneEnd(ctx, SystemOneEndData{Response: resp, Err: err, Attempts: res.attempts})
