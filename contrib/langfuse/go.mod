@@ -4,9 +4,8 @@ go 1.25.0
 
 require (
 	github.com/fgn/go-langfuse v0.10.0
-	github.com/fgn/jevgo v0.0.0
+	github.com/fgn/jevgo v0.1.0
 	github.com/matryer/is v1.4.1
-	go.opentelemetry.io/otel v1.45.0
 	go.opentelemetry.io/otel/sdk v1.45.0
 )
 
@@ -18,6 +17,7 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
+	go.opentelemetry.io/otel v1.45.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.45.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.45.0 // indirect
 	go.opentelemetry.io/otel/metric v1.45.0 // indirect
@@ -31,6 +31,3 @@ require (
 	google.golang.org/grpc v1.83.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 )
-
-// Until the core module is tagged, resolve it from this repository.
-replace github.com/fgn/jevgo => ../..
