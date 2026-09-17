@@ -180,6 +180,6 @@ task        # format, lint, test
 task test:live   # exercises the real API with TYPESAFE_API_KEY
 ```
 
-The docs, official SDK sources, and OpenAPI spec this client was built from
-are kept locally under `ref/` (not committed); see the
-[TypeSafe docs](https://docs.typesafe.ai) for the live versions.
+Behavior follows the [TypeSafe API reference](https://docs.typesafe.ai/api)
+and the official SDKs; the defaults for timeouts, retries, and headers match
+theirs so that switching between SDKs is not a behavior change.
