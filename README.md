@@ -22,7 +22,14 @@ it is not affiliated with TypeSafe.
 go get github.com/fgn/jevgo
 ```
 
-Set `TYPESAFE_API_KEY` in your environment, then:
+Pass the API key explicitly, or set `TYPESAFE_API_KEY` in the environment
+and call `jev.NewClient()` with no options:
+
+```go
+client, err := jev.NewClient(jev.WithAPIKey(os.Getenv("MY_TYPESAFE_KEY")))
+```
+
+A complete program:
 
 ```go
 package main

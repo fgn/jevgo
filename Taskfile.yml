@@ -58,16 +58,17 @@ tasks:
       - task: lint:golangci-lint
       - task: lint:govulncheck
   test:
-    desc: run all tests
+    desc: run all tests in every module
     cmds:
-      - go test {{ .CLI_ARGS | default "-count=1 -cover -timeout 60s ./..." }}
+      - for: { var: MODULES }
+        cmd: cd {{.ITEM}} && go test {{ .CLI_ARGS | default "-count=1 -cover -timeout 60s ./..." }}
   test:live:
     desc: run the tests against the real API using the TYPESAFE_API_KEY environment variable
     preconditions:
       - sh: test -n "$TYPESAFE_API_KEY"
         msg: "set TYPESAFE_API_KEY"
     cmds:
-      - go test -count=1 -run 'Live' -v ./...
+      - go test -count=1 -run 'Live' -v .
   all:
     desc: run all code formatters, linters, and tests
     cmds:
