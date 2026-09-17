@@ -1,0 +1,79 @@
+# https://taskfile.dev
+version: "3"
+
+env:
+  CGO_ENABLED: "0"
+
+vars:
+  MODULES: ". ./contrib/langfuse"
+
+tasks:
+  install:gofumpt:
+    status:
+      - which gofumpt
+    preconditions:
+      - sh: which go
+        msg: "please, install go"
+    cmds:
+      # https://github.com/mvdan/gofumpt
+      - go install mvdan.cc/gofumpt@latest
+  install:golangci-lint:
+    status:
+      - test -f ./bin/golangci-lint
+      - ./bin/golangci-lint --version | grep -F '2.9.0'
+    cmds:
+      # https://golangci-lint.run/welcome/install/#binaries
+      - >
+        curl -sSfL
+        https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh
+        | sh -s -- -b ./bin v2.9.0
+  install:govulncheck:
+    status:
+      - which govulncheck
+      - govulncheck --version | grep -F '1.1.4'
+    cmds:
+      - go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
+  format:
+    desc: run all code formatters
+    cmds:
+      - task: install:gofumpt
+      - gofumpt -w . contrib
+      - for: { var: MODULES }
+        cmd: cd {{.ITEM}} && go mod edit -fmt && go mod tidy
+      - go work sync
+  lint:golangci-lint:
+    cmds:
+      - task: install:golangci-lint
+      - for: { var: MODULES }
+        cmd: cd {{.ITEM}} && {{.ROOT_DIR}}/bin/golangci-lint run --timeout 120s
+  lint:govulncheck:
+    cmds:
+      - task: install:govulncheck
+      - for: { var: MODULES }
+        cmd: cd {{.ITEM}} && govulncheck ./...
+  lint:
+    desc: run all linters
+    cmds:
+      - task: lint:golangci-lint
+      - task: lint:govulncheck
+  test:
+    desc: run all tests
+    cmds:
+      - go test {{ .CLI_ARGS | default "-count=1 -cover -timeout 60s ./..." }}
+  test:live:
+    desc: run the tests against the real API using the TYPESAFE_API_KEY environment variable
+    preconditions:
+      - sh: test -n "$TYPESAFE_API_KEY"
+        msg: "set TYPESAFE_API_KEY"
+    cmds:
+      - go test -count=1 -run 'Live' -v ./...
+  all:
+    desc: run all code formatters, linters, and tests
+    cmds:
+      - task: format
+      - task: lint
+      - task: test
+  default:
+    cmds:
+      - task: all

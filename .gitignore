@@ -1,0 +1,6 @@
+.foo/
+bin/
+ref/
+*.test
+coverage.out
+go.work.sum
